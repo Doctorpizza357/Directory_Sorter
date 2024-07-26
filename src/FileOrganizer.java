@@ -51,7 +51,6 @@ public class FileOrganizer {
                 return;
             }
 
-            // Start the file organization in a separate thread
             executor.submit(() -> startWatching(folder.toPath()));
 
             organizeFiles(folder);

@@ -7,33 +7,25 @@ import java.nio.file.Paths;
 import java.util.function.Consumer;
 
 public class FileOrganizerGUI extends JFrame {
-    private JButton selectFolderButton;
     private JButton toggleButton;
     private JTextArea logArea;
     private JCheckBox autoStartCheckbox;
     private FileOrganizer organizer;
     private boolean isMonitoring = false;
-    private File defaultFolder;
 
     public FileOrganizerGUI() {
         setTitle("Auto File Organizer");
         setSize(600, 400);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-        initComponents();
+        initializeComponents();
+        setupDefaultFolder();
     }
 
-    private void initComponents() {
+    private void initializeComponents() {
         JPanel mainPanel = new JPanel(new BorderLayout());
 
-        // Set default folder to Downloads
-        String userHome = System.getProperty("user.home");
-        defaultFolder = new File(userHome, "Downloads");
-        if (!defaultFolder.exists()) {
-            defaultFolder.mkdirs(); // Create Downloads folder if it doesn't exist
-        }
-
         JPanel controlPanel = new JPanel();
-        selectFolderButton = new JButton("Select Folder");
+        JButton selectFolderButton = new JButton("Select Folder");
         toggleButton = new JButton("Start Monitoring");
         autoStartCheckbox = new JCheckBox("Auto-start with Windows");
 
@@ -50,12 +42,14 @@ public class FileOrganizerGUI extends JFrame {
 
         mainPanel.add(controlPanel, BorderLayout.NORTH);
         mainPanel.add(new JScrollPane(logArea), BorderLayout.CENTER);
-
         add(mainPanel);
+    }
 
-        // Initialize organizer with default folder
-        organizer = new FileOrganizer(defaultFolder, this::log);
-        log("Default folder set to: " + defaultFolder.getAbsolutePath());
+    private void setupDefaultFolder() {
+        File downloads = new File(System.getProperty("user.home"), "Downloads");
+        if (!downloads.exists()) downloads.mkdir();
+        organizer = new FileOrganizer(downloads, this::log);
+        log("Default folder set to: " + downloads.getAbsolutePath());
     }
 
     private void selectFolder() {
@@ -131,7 +125,10 @@ public class FileOrganizerGUI extends JFrame {
     }
 
     private void log(String message) {
-        SwingUtilities.invokeLater(() -> logArea.append(message + "\n"));
+        SwingUtilities.invokeLater(() -> {
+            logArea.append(message + "\n");
+            logArea.setCaretPosition(logArea.getDocument().getLength());
+        });
     }
 
     public static void main(String[] args) {

@@ -2,23 +2,26 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.AccessDeniedException;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
-import java.util.HashMap;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 
 public class FileOrganizer {
 
     private static final Map<String, String> fileTypes = new HashMap<>();
-    private static final boolean MOVE_FOLDERS = true; // Set to false if you don't want to move folders
+    private static final boolean MOVE_FOLDERS = true;
     private static final int MAX_RETRIES = 3;
-    private static final int RETRY_DELAY_MS = 1000; // 1 seconds
-    private static final int MOVE_DELAY_MS = 500; // 0.5 seconds
-    private static final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private static final Object fileLock = new Object();
+    private static final int RETRY_DELAY_MS = 1000;
+    private static final int MOVE_DELAY_MS = 500;
+
+    private final Path targetFolder;
+    private final Path uncategorizedFolder;
+    private ExecutorService executor;
+    private final Consumer<String> logger;
 
     static {
         fileTypes.put("jpg", "Images");
@@ -38,30 +41,48 @@ public class FileOrganizer {
         fileTypes.put("ppt", "Presentations");
         fileTypes.put("pptx", "Presentations");
         fileTypes.put("exe", "Executables");
-        // Add more file types and their respective folders as needed
+        fileTypes.put("mp4", "Videos");
+        fileTypes.put("zip", "Archives");
     }
 
-    public static void main(String[] args) {
-        if (args.length > 0) {
-            String folderPath = args[0];
-            System.out.println("Monitoring folder: " + folderPath);
-            File folder = new File(folderPath);
-            if (!folder.exists() || !folder.isDirectory()) {
-                System.out.println("Invalid folder path.");
-                return;
-            }
+    public FileOrganizer(File folder, Consumer<String> logger) {
+        this.logger = logger;
+        this.targetFolder = folder.toPath();
+        this.uncategorizedFolder = targetFolder.resolve("Uncategorized");
+        createUncategorizedFolder();
+    }
 
-            executor.submit(() -> startWatching(folder.toPath()));
-
-            organizeFiles(folder);
+    private void createUncategorizedFolder() {
+        try {
+            Files.createDirectories(uncategorizedFolder);
+        } catch (IOException e) {
+            logger.accept("Couldn't create uncategorized folder: " + e.getMessage());
         }
     }
 
-    private static void startWatching(Path path) {
-        try (WatchService watchService = FileSystems.getDefault().newWatchService()) {
-            path.register(watchService, StandardWatchEventKinds.ENTRY_CREATE, StandardWatchEventKinds.ENTRY_CREATE);
+    public void startMonitoring() {
+        executor = Executors.newSingleThreadExecutor();
+        executor.submit(() -> {
+            try {
+                organizeFiles(targetFolder.toFile()); // Organize existing files first
+                startWatching(targetFolder);
+            } catch (IOException e) {
+                logger.accept("Monitoring error: " + e.getMessage());
+            }
+        });
+    }
 
-            while (true) {
+    public void stopMonitoring() {
+        if (executor != null) {
+            executor.shutdownNow();
+        }
+    }
+
+    private void startWatching(Path path) throws IOException {
+        try (WatchService watchService = FileSystems.getDefault().newWatchService()) {
+            path.register(watchService, StandardWatchEventKinds.ENTRY_CREATE);
+
+            while (!Thread.currentThread().isInterrupted()) {
                 WatchKey key;
                 try {
                     key = watchService.take();
@@ -72,130 +93,96 @@ public class FileOrganizer {
 
                 for (WatchEvent<?> event : key.pollEvents()) {
                     WatchEvent.Kind<?> kind = event.kind();
-                    WatchEvent<Path> ev = (WatchEvent<Path>) event;
-                    Path fileName = ev.context();
-
-                    if (kind == StandardWatchEventKinds.OVERFLOW) {
-                        continue;
-                    }
-
-                    if (kind == StandardWatchEventKinds.ENTRY_CREATE || kind == StandardWatchEventKinds.ENTRY_CREATE) {
-                        System.out.println("Detected new file or folder: " + fileName);
+                    if (kind == StandardWatchEventKinds.ENTRY_CREATE) {
+                        logger.accept("Detected new file/folder");
                         organizeFiles(path.toFile());
                     }
                 }
 
-                boolean valid = key.reset();
-                if (!valid) {
+                if (!key.reset()) {
                     break;
                 }
             }
-        } catch (IOException e) {
-            System.out.println("Error setting up watch service.");
-            e.printStackTrace();
         }
     }
 
-    private static void organizeFiles(File folder) {
+    private void organizeFiles(File folder) {
         File[] files = folder.listFiles();
         if (files == null || files.length == 0) {
-            System.out.println("No files to organize.");
+            logger.accept("No files to organize");
             return;
         }
 
         File foldersDir = null;
         if (MOVE_FOLDERS) {
             foldersDir = new File(folder, "Folders");
-            if (!foldersDir.exists()) {
-                foldersDir.mkdir();
+            if (!foldersDir.exists() && !foldersDir.mkdir()) {
+                logger.accept("Failed to create Folders directory");
             }
         }
 
-        // Create a set of folder names that should be skipped
         Set<String> skipFolders = new HashSet<>(fileTypes.values());
         skipFolders.add("Folders");
+        skipFolders.add("Uncategorized");
 
-        // Move directories first
+        // Process directories
         for (File file : files) {
             if (file.isDirectory() && MOVE_FOLDERS && !skipFolders.contains(file.getName())) {
                 try {
                     moveFileWithRetry(file.toPath(), new File(foldersDir, file.getName()).toPath());
-                    System.out.println("Moved folder: " + file.getName() + " to folder: Folders");
+                    logger.accept("Moved folder: " + file.getName() + " to Folders");
                 } catch (IOException e) {
-                    System.out.println("Failed to move folder: " + file.getName());
-                    e.printStackTrace();
+                    logger.accept("Failed to move folder: " + file.getName() + " - " + e.getMessage());
                 }
             }
         }
 
-        // Move files second
+        // Process files
         for (File file : files) {
             if (file.isFile()) {
-                String fileExtension = getFileExtension(file.getName());
-                String folderName = fileTypes.get(fileExtension.toLowerCase());
+                String ext = getFileExtension(file.getName()).toLowerCase();
+                String category = fileTypes.getOrDefault(ext, "Uncategorized");
 
-                if (folderName != null) {
-                    File targetFolder = new File(folder, folderName);
-                    if (!targetFolder.exists()) {
-                        targetFolder.mkdir();
-                    }
+                File targetDir = new File(folder, category);
+                if (!targetDir.exists() && !targetDir.mkdir()) {
+                    logger.accept("Failed to create directory: " + category);
+                }
 
-                    try {
-                        moveFileWithDelay(file.toPath(), new File(targetFolder, file.getName()).toPath());
-                        System.out.println("Moved file: " + file.getName() + " to folder: " + folderName);
-                    } catch (IOException e) {
-                        System.out.println("Failed to move file: " + file.getName());
-                        e.printStackTrace();
-                    }
-                } else if ("zip".equalsIgnoreCase(fileExtension) && MOVE_FOLDERS) {
-                    try {
-                        moveFileWithRetry(file.toPath(), new File(foldersDir, file.getName()).toPath());
-                        System.out.println("Moved zip file: " + file.getName() + " to folder: Folders");
-                    } catch (IOException e) {
-                        System.out.println("Failed to move zip file: " + file.getName());
-                        e.printStackTrace();
-                    }
+                try {
+                    moveFileWithDelay(file.toPath(), new File(targetDir, file.getName()).toPath());
+                    logger.accept("Moved file: " + file.getName() + " to " + category);
+                } catch (IOException e) {
+                    logger.accept("Failed to move file: " + file.getName() + " - " + e.getMessage());
                 }
             }
         }
     }
 
     private static String getFileExtension(String fileName) {
-        int lastIndexOfDot = fileName.lastIndexOf('.');
-        if (lastIndexOfDot == -1) {
-            return "";
-        }
-        return fileName.substring(lastIndexOfDot + 1);
+        int lastDot = fileName.lastIndexOf('.');
+        return lastDot == -1 ? "" : fileName.substring(lastDot + 1);
     }
 
-    private static void moveFileWithRetry(Path source, Path target) throws IOException {
+    private void moveFileWithRetry(Path source, Path target) throws IOException {
         int attempts = 0;
         while (attempts < MAX_RETRIES) {
             try {
                 Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
                 return;
             } catch (FileSystemException e) {
-                attempts++;
-                if (attempts >= MAX_RETRIES) {
-                    throw new IOException("Failed to move file after " + MAX_RETRIES + " attempts", e);
-                }
-                try {
-                    Thread.sleep(RETRY_DELAY_MS);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while waiting to retry file move", ie);
-                }
+                if (++attempts >= MAX_RETRIES) throw e;
+                try { Thread.sleep(RETRY_DELAY_MS); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
             }
         }
     }
 
-    private static void moveFileWithDelay(Path source, Path target) throws IOException {
+    private void moveFileWithDelay(Path source, Path target) throws IOException {
         try {
             Thread.sleep(MOVE_DELAY_MS);
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new IOException("Interrupted while waiting to move file", e);
         }
     }
 }
